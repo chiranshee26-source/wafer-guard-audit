@@ -74,12 +74,13 @@ flowchart TD
     F:::bug2
     H:::bug2
     A:::bug3
-    classDef bug1 fill:#ffd6d6,stroke:#c00
-    classDef bug2 fill:#fff1c2,stroke:#b80
-    classDef bug3 fill:#dbe8ff,stroke:#24c
+    classDef bug1 fill:#ffd6d6,stroke:#c00,color:#000
+    classDef bug2 fill:#fff1c2,stroke:#b80,color:#000
+    classDef bug3 fill:#dbe8ff,stroke:#24c,color:#000
 ```
 
-Colour key: red = **Bug 1 (leakage)**, yellow = **Bug 2 (broadcasting)**, blue = **Bug 3 (PS-L invariant blindness)**.
+Colour key: the coloured boxes are the steps where a bug lives.
+🟥 red = **Bug 1 (leakage)** · 🟨 yellow = **Bug 2 (broadcasting)** · 🟦 blue = **Bug 3 (PS-L invariant blindness)**.
 Bug 3 starts at loading, where the sentinel and codes are never detected. Its damage
 continues through the impute and scale steps, where they are treated as real numbers.
 
