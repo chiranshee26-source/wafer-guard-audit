@@ -1,3 +1,5 @@
-artifacts/
 .ipynb_checkpoints/
 __pycache__/
+artifacts/_test_*
+scores.csv
+*.zip

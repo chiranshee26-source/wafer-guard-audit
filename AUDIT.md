@@ -1,87 +1,50 @@
 # WAFER-GUARD Audit — Fab-7 Excursion Detector
 
-**Recommendation: NO-GO.** The reported F1 ≥ 0.90 comes from leakage, not from the model. After the repairs below, the model is close to chance on future wafers at natural prevalence.
+**Recommendation: NO-GO.** The original notebook, re-run unchanged, scores F1 0.9915 and ROC-AUC 1.000 (`original/wafer_guard_original_executed.ipynb`). That score is an artefact of leakage. Repaired and evaluated causally, the model reaches **F1 0.233**, far below the 0.90 gate. All numbers come from `wafer_guard_fixed.ipynb` (`results.json`). The notebook is deterministic: two clean runs gave identical results.
 
-All numbers below come from `wafer_guard_fixed.ipynb` (seed 1337, CPU, deterministic; two runs gave identical metrics).
+## Q1 · The three silent bugs and their fixes
 
----
+| # | Bug | Where | Mechanism and evidence | Fix |
+|---|---|---|---|---|
+| 1 | **Data leakage** | §2: imputer → scaler → SMOTE → random split | Statistics were fit on all 1,567 lots, including future and test lots. SMOTE ran before the split, so **274 of 293** test "defects" were synthetic copies of training defects. The test set was 50 % defective, and the split shuffled 3 months of drifting data. A plain logistic regression "passes" with **F1 0.932** under this protocol. | Time-ordered windows. Each lot is scaled only with statistics from earlier lots, frozen at the start of every validation/test window. No SMOTE (`pos_weight` instead). 24 h label embargo before each evaluation window. Settings, epochs and threshold come from 5-fold walk-forward validation. Test is scored once. |
+| 2 | **Corrupted loss gradients** | §3 `unsqueeze(1)` + §5 `mean((reconstructed - batch_x)**2)` | `[64, 590] − [64, 1, 590]` silently broadcasts to **`[64, 64, 590]`**. The gradient points exactly toward the batch mean (cosine **1.000**), not toward each wafer (cosine 0.716). | Flat `[B, F]` tensors, masked per-element MSE, hard asserts on recon/target/mask/logit/label shapes. |
+| 3 | **Invariant blindness (PS-L)** | §1–2: all 590 columns treated as continuous | 146 lots have the sentinel `sensor_0 == 0.0`, and on exactly those lots `sensor_1` is a firmware code (100/200/300). Treating them as numbers inflated σ(sensor_0) from 74 to 880 and σ(sensor_1) from 80 to 675, put every PS-L lot at z = −3.1, and read code 300 as "3× code 100". | Per-row detection with an assert on unknown codes. `is_legacy` + one-hot code as categorical inputs. On PS-L lots both channels are set to missing, so they are excluded from every statistic, never imputed into the target, and masked out of the loss. |
 
-## 1. The three silent bugs
+## Q2 · True metrics at natural prevalence
 
-### Bug 1 — Data leakage (severity: critical)
-**Where:** original §2, preprocessing and split.
-**Mechanism:**
-- `SimpleImputer` and `StandardScaler` were fit on **all 1,567 rows**, including future and test lots.
-- **SMOTE ran before the split.** Synthetic defects built from training defects ended up in the test set: **274 of the 293** test "defects" are synthetic.
-- The test set was **50 % defective**, against a natural rate of 6.6 %.
-- `train_test_split` shuffled lots from 2008-07-19 to 2008-10-17. The model was trained on the future and tested on the past.
+Test window: the last 20 % of lots in time (313 lots, 2008-10-02 → 10-17), **17 defects = 0.054 prevalence**. That is the natural rate for that period; the dataset average is 6.6 %, and the rate drifts over time. The test set was not resampled. The threshold **0.003** was frozen on pooled walk-forward validation before the test was scored.
 
-**Evidence:** a plain logistic regression scores **F1 = 0.932** under the original protocol. Under a causal protocol the same model gets **PR-AUC 0.090**. The release gate was measuring the leak.
+| Metric | Repaired SAE | Logistic baseline (same protocol) |
+|---|---|---|
+| **F1** | **0.233** (95 % bootstrap CI 0.061 – 0.391) | 0.154 |
+| Precision / Recall | 0.192 / 0.294 | 0.222 / 0.118 |
+| **PR-AUC** (no-skill = 0.054) | **0.171** (CI 0.084 – 0.368), 3.2× lift | 0.141 |
+| ROC-AUC | 0.747 | 0.724 |
+| TN / FP / FN / TP | 275 / 21 / 12 / 5 | — |
 
-**Fix:**
-- Rows are sorted by `timestamp` and split by time: train 60 % (Jul 19 – Sep 20), val 20 % (Sep 20 – Oct 2), test 20 % (Oct 2 – Oct 17).
-- Column filtering, median imputation and scaling are fit on train rows only. `transform` is row-wise.
-- SMOTE is removed. Imbalance is handled with BCE `pos_weight = 11.37`, computed from train only.
-- Epoch selection and the decision threshold use validation only. Test is scored once.
+**Is the F1 real?** The notebook (§9) checks it six ways:
 
-### Bug 2 — Corrupted loss gradients via broadcasting (severity: critical)
-**Where:** original §3 and §5. The loader `unsqueeze(1)` makes `batch_x` shape `[B, 1, F]`, while the model's `flatten` returns `reconstructed` as `[B, F]`.
-**Mechanism:** `(reconstructed - batch_x)` silently broadcasts to **`[64, 64, 590]`**, so each reconstruction is compared against *every* wafer in the batch. The minimiser of that loss is the batch mean.
-**Evidence:** the broken gradient has cosine **0.714** with the correct gradient and **1.000** with the "move toward the batch mean" gradient. The decoder learns to output the average wafer, and the encoder gets no per-wafer reconstruction signal.
-**Fix:**
-- Tensors stay flat `[B, F]` throughout.
-- The loss is a masked per-element MSE with `assert recon.shape == target.shape == mask.shape`.
-- There is also an assert that logits and labels are both `[B]`.
+1. F1 recomputed by hand from the confusion matrix matches sklearn.
+2. The label direction is verified (flipped scores give ROC-AUC 0.25).
+3. A positive control, trained on the test lots themselves, reaches F1 1.000, so the code can score high.
+4. The best F1 achievable at *any* threshold is only 0.258, so the threshold is not the problem.
+5. With only 17 test defects the bootstrap interval is wide (0.061 – 0.391).
+6. Five other seeds give F1 0.125 – 0.200 and PR-AUC 0.127 – 0.210.
 
-### Bug 3 — Invariant blindness: legacy probe station PS-L (severity: high)
-**Where:** original §2, where all 590 sensors are treated as continuous.
-**Mechanism:**
-- **146 wafers (9.3 %)** have `sensor_0 == 0.0`, a PS-L sentinel. On exactly those rows `sensor_1` holds firmware codes **100 (61), 200 (35) and 300 (50)**.
-- The original pipeline mean-imputed and z-scored these as measurements. That inflated σ(sensor_0) from 74 to **880** and σ(sensor_1) from 80 to **675**.
-- Every PS-L wafer sat at z = −3.1, which looks like a fake excursion.
-- The codes were read as ordinal magnitudes (300 counted as "more" than 100).
-- PS-L wafers have a **0 % defect rate** (vs 7.3 % on current-gen), so the model could learn "station type" instead of "defect".
+## Residual risks
 
-**Fix:**
-- PS-L is detected per row with the exact `sensor_0 == 0.0` rule. Unexpected codes trigger an `assert`.
-- New categorical inputs: `is_legacy` plus a one-hot `ps_l_code_{100,200,300}`. These are not scaled.
-- On PS-L rows, `sensor_0` and `sensor_1` are set to *missing*. They are left out of scaler statistics and imputation, set to a neutral 0 in the input, and **masked out of the reconstruction loss**. No made-up continuous value enters training.
-- The evaluator mask file was used only to confirm the rule matches it (146/146 rows). The pipeline does not read it.
+- **Weak and uncertain signal:** 17 test defects, wide CIs.
+- **Calibration shift:** fold models alarm on 25 % of validation lots, the refit model on 8 % of test lots.
+- **Frozen statistics:** the scaling statistics in `artifacts/` are frozen at 2008-10-02 and must be refreshed as the line drifts.
+- **PS-L confounding:** PS-L lots never fail in this data, and two PS-L lots (rows 109, 1203) carry extreme values that only robust scaling and the ±10 clip contain.
+- **Disclosure:** this is the third repaired version. Earlier versions scored test F1 0.146 and 0.000. Both used a single 11-defect validation window and scaling statistics fit on the whole training window, and the second picked an epoch-2, barely trained model. The method was redesigned for those methodological reasons, and every v3 setting was fixed before its single test run.
+- **Reference mask:** the PS-L rule was derived from the telemetry. It agrees with the reference mask supplied with the task on all 146 lots, and the pipeline never reads that file.
 
----
+## Go / no-go
 
-## 2. True metrics at natural prevalence (held-out future window)
+**NO-GO.** The detector carries real but weak signal (3× better than chance, ROC-AUC 0.75). It would catch roughly 3 in 10 excursions with about 4 false alarms per true alarm.
 
-Test set: 314 wafers from 2008-10-02 to 2008-10-17, 17 defects (**5.4 % prevalence**, natural and not resampled). The threshold was frozen on validation at 0.628.
-
-| Metric | Repaired model |
-|---|---|
-| **PR-AUC (average precision)** | **0.059** (no-skill baseline = 0.054, 1.09×) |
-| ROC-AUC | 0.498 |
-| F1 @ val threshold | 0.000 |
-| Precision / Recall | 0.000 / 0.000 |
-| Confusion (TN / FP / FN / TP) | 293 / 4 / 17 / 0 |
-
-**Why these metrics:** at about 6 % prevalence, accuracy and ROC-AUC look good even for useless models. PR-AUC compared with the prevalence baseline is the main measure. F1, precision and recall are reported at a threshold chosen without test labels.
-
-**Disclosure:**
-- Hyper-parameters (hidden 256, latent 8, wd 1e-2, lr 1e-4) came from a 32-config sweep scored on **validation PR-AUC only**.
-- Before that sweep, the notebook's original hyper-parameters were also run through the repaired pipeline once. That run got test PR-AUC 0.102, ROC-AUC 0.595 and F1 0.146, with a degenerate val threshold of 0.0001.
-- Neither configuration was chosen using test results. Both runs are near the no-skill line.
-
----
-
-## 3. Residual risks
-- **Tiny validation signal:** only 11 val defects, so epoch and threshold selection is noisy. The best validation epoch was 2, meaning almost nothing learned carries forward in time.
-- **Temporal drift:** the defect rate moves from 8.1 % (train) to 3.5 % (val) to 5.4 % (test).
-- **Station confounding:** PS-L wafers never fail in this data. A future PS-L failure would be scored with almost no evidence.
-- **Clipping and imputation:** the ±10σ clip and train-median imputation are simple choices and should be monitored in production.
-
-## 4. Go / no-go
-**NO-GO.** Do not deploy on Friday.
-
-Before this model is reconsidered:
+Before resubmitting:
 1. Collect more labelled excursions.
-2. Use rolling-origin (walk-forward) validation.
-3. Compare against simple baselines such as logistic regression or gradient boosting with feature selection.
-4. Set a release gate on time-split **PR-AUC lift over prevalence**, not on F1 from a balanced test set.
+2. Replace the F1-on-balanced-data gate with a time-split PR-AUC gate.
+3. Add drift monitoring for the scaling statistics and the PS-L share.
