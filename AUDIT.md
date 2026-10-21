@@ -6,9 +6,9 @@
 
 | # | Bug | Where | Mechanism and evidence | Fix |
 |---|---|---|---|---|
-| 1 | **Data leakage** | §2: imputer → scaler → SMOTE → random split | Statistics were fit on all 1,567 lots, including future and test lots. SMOTE ran before the split, so **274 of 293** test "defects" were synthetic copies of training defects. The test set was 50 % defective, and the split shuffled 3 months of drifting data. A plain logistic regression "passes" with **F1 0.932** under this protocol. | Time-ordered windows. Each lot is scaled only with statistics from earlier lots, frozen at the start of every validation/test window. No SMOTE (`pos_weight` instead). 24 h label embargo before each evaluation window. Settings, epochs and threshold come from 5-fold walk-forward validation. Test is scored once. |
-| 2 | **Corrupted loss gradients** | §3 `unsqueeze(1)` + §5 `mean((reconstructed - batch_x)**2)` | `[64, 590] − [64, 1, 590]` silently broadcasts to **`[64, 64, 590]`**. The gradient points exactly toward the batch mean (cosine **1.000**), not toward each wafer (cosine 0.716). | Flat `[B, F]` tensors, masked per-element MSE, hard asserts on recon/target/mask/logit/label shapes. |
-| 3 | **Invariant blindness (PS-L)** | §1–2: all 590 columns treated as continuous | 146 lots have the sentinel `sensor_0 == 0.0`, and on exactly those lots `sensor_1` is a firmware code (100/200/300). Treating them as numbers inflated σ(sensor_0) from 74 to 880 and σ(sensor_1) from 80 to 675, put every PS-L lot at z = −3.1, and read code 300 as "3× code 100". | Per-row detection with an assert on unknown codes. `is_legacy` + one-hot code as categorical inputs. On PS-L lots both channels are set to missing, so they are excluded from every statistic, never imputed into the target, and masked out of the loss. |
+| 1 | **Data leakage** | Section 2: imputer → scaler → SMOTE → random split | Statistics were fit on all 1,567 lots, including future and test lots. SMOTE ran before the split, so **274 of 293** test "defects" were synthetic copies of training defects. The test set was 50 % defective, and the split shuffled 3 months of drifting data. A plain logistic regression "passes" with **F1 0.932** under this protocol. | Time-ordered windows. Each lot is scaled only with statistics from earlier lots, frozen at the start of every validation/test window. No SMOTE (`pos_weight` instead). 24 h label embargo before each evaluation window. Settings, epochs and threshold come from 5-fold walk-forward validation. Test is scored once. |
+| 2 | **Corrupted loss gradients** | Section 3 `unsqueeze(1)` + Section 5 `mean((reconstructed - batch_x)**2)` | `[64, 590] − [64, 1, 590]` silently broadcasts to **`[64, 64, 590]`**. The gradient points exactly toward the batch mean (cosine **1.000**), not toward each wafer (cosine 0.716). | Flat `[B, F]` tensors, masked per-element MSE, hard asserts on recon/target/mask/logit/label shapes. |
+| 3 | **Invariant blindness (PS-L)** | Sections 1–2: all 590 columns treated as continuous | 146 lots have the sentinel `sensor_0 == 0.0`, and on exactly those lots `sensor_1` is a firmware code (100/200/300). Treating them as numbers inflated σ(sensor_0) from 74 to 880 and σ(sensor_1) from 80 to 675, put every PS-L lot at z = −3.1, and read code 300 as "3× code 100". | Per-row detection with an assert on unknown codes. `is_legacy` + one-hot code as categorical inputs. On PS-L lots both channels are set to missing, so they are excluded from every statistic, never imputed into the target, and masked out of the loss. |
 
 ## Q2 · True metrics at natural prevalence
 
@@ -22,7 +22,7 @@ Test window: the last 20 % of lots in time (313 lots, 2008-10-02 → 10-17), **1
 | ROC-AUC | 0.747 | 0.724 |
 | TN / FP / FN / TP | 275 / 21 / 12 / 5 | — |
 
-**Is the F1 real?** The notebook (§9) checks it six ways:
+**Is the F1 real?** The notebook (Section 9) checks it six ways:
 
 1. F1 recomputed by hand from the confusion matrix matches sklearn.
 2. The label direction is verified (flipped scores give ROC-AUC 0.25).

@@ -15,18 +15,40 @@ repaired model scores **F1 0.233** (PR-AUC 0.171 against a chance level of 0.054
 
 **Recommendation: NO-GO.**
 
-| File | What it is |
-|---|---|
-| `wafer_guard_fixed.ipynb` | The repaired pipeline, fully executed with all outputs |
-| `AUDIT.md` | One-page audit: the 3 bugs, the fixes, the measured metrics, go/no-go |
-| `README.md` | This file: pipeline, architecture, where each fault sits, how it was fixed |
-| `inference.py` | Standalone scorer that loads the saved model and scores new wafers |
-| `artifacts/` | Saved model (`wafer_sae.pt`), scaling statistics (`preprocess_state.npz`), settings (`config.json`) |
-| `results.json` | Every metric the notebook measured, machine-readable |
-| `check_docs.py` | Confirms the numbers in README.md / AUDIT.md match `results.json` |
-| `original/wafer_guard_original_executed.ipynb` | The original notebook, executed unchanged except that its `!pip install` line is commented out. Evidence for the 0.9915 claim |
-| `secom_telemetry_modified.csv` | Input data: 1,567 wafer lots × 590 sensors + label + timestamp |
-| `requirements.txt` | Exact library versions used |
+### Why this matters
+
+In a semiconductor fab, a defective wafer that is not caught early keeps moving down the line,
+using up processing, test and packaging capacity before it is scrapped. An in-line excursion
+detector is meant to flag those wafers from sensor telemetry as soon as a lot starts.
+
+Two kinds of mistake cost money:
+
+- **A missed defect** wastes all the downstream work spent on that wafer.
+- **A false alarm** pulls a good wafer or tool off the line for inspection.
+
+A model whose score comes from leaked information would fail on the line while looking excellent
+on paper. Catching that before the Friday release is the point of this audit.
+
+### Repository structure
+
+```text
+wafer-guard/
+├── wafer_guard_fixed.ipynb        # repaired pipeline, fully executed with all outputs
+├── AUDIT.md                       # one-page audit: 3 bugs, fixes, measured metrics, go/no-go
+├── README.md                      # this file: pipeline, architecture, faults, fixes, results
+├── inference.py                   # standalone scorer: loads artifacts/ and scores new wafers
+├── check_docs.py                  # confirms the numbers in README.md / AUDIT.md match results.json
+├── results.json                   # every metric the notebook measured, machine-readable
+├── requirements.txt               # exact library versions used
+├── secom_telemetry_modified.csv   # input data: 1,567 lots × 590 sensors + label + timestamp
+├── artifacts/
+│   ├── wafer_sae.pt               # trained model weights
+│   ├── preprocess_state.npz       # kept columns + scaling statistics
+│   └── config.json                # model sizes, PS-L codes, decision threshold
+└── original/
+    └── wafer_guard_original_executed.ipynb   # original notebook, executed unchanged except
+                                              # its !pip line commented out (evidence for 0.9915)
+```
 
 ---
 
@@ -182,7 +204,7 @@ flowchart LR
 
 ### Bug 1 — Data leakage (pipeline: preprocessing → split → evaluation)
 
-**Where:** original §2, which ran `imputer.fit_transform(X_raw)` → `scaler.fit_transform` → `SMOTE.fit_resample` → `train_test_split`.
+**Where:** original Section 2, which ran `imputer.fit_transform(X_raw)` → `scaler.fit_transform` → `SMOTE.fit_resample` → `train_test_split`.
 
 **What went wrong:**
 - Imputer and scaler statistics came from every lot, including future and test lots.
@@ -190,7 +212,7 @@ flowchart LR
 - The split was random across three months of drifting data.
 - The test set was 50 % defective instead of about 6 %.
 
-**Evidence (notebook §10, plus the executed original):**
+**Evidence (notebook Section 10, plus the executed original):**
 - The original scores F1 0.9915 and ROC-AUC 1.000.
 - **274 of 293** test "defects" are SMOTE synthetics.
 - A plain logistic regression also "passes", with F1 0.932.
@@ -204,19 +226,19 @@ flowchart LR
 
 ### Bug 2 — Corrupted loss gradients (architecture: loader ↔ forward ↔ loss)
 
-**Where:** original §3 `make_loader` (`unsqueeze(1)`) with §5 `torch.mean((reconstructed - batch_x) ** 2)`.
+**Where:** original Section 3 `make_loader` (`unsqueeze(1)`) with Section 5 `torch.mean((reconstructed - batch_x) ** 2)`.
 
 **What went wrong:** `[64, 590] − [64, 1, 590]` silently becomes `[64, 64, 590]`. The loss is
 minimised by outputting the batch average.
 
-**Evidence (§10):** the broken gradient has cosine similarity **1.000** with the gradient toward
+**Evidence (Section 10):** the broken gradient has cosine similarity **1.000** with the gradient toward
 the batch mean, and only **0.716** with the correct per-wafer gradient.
 
 **Fix:** flat tensors, a masked per-element MSE, and hard shape asserts on every loss input.
 
 ### Bug 3 — Invariant blindness to probe station PS-L (pipeline: feature handling)
 
-**Where:** original §1–§2, where all 590 columns go straight into mean-imputation and scaling.
+**Where:** original Sections 1–2, where all 590 columns go straight into mean-imputation and scaling.
 
 **What went wrong:**
 - On 146 lots, `sensor_0 = 0.0` is a sentinel and `sensor_1 ∈ {100, 200, 300}` is a firmware code.
@@ -255,10 +277,25 @@ before the test set was scored.
 | **PR-AUC** | 1.000 | **0.171** (CI 0.084 – 0.368), 3.2× chance | 0.141 |
 | TN / FP / FN / TP | 288 / 5 / 0 / 293 | 275 / 21 / 12 / 5 | — |
 
-**Why PR-AUC is the main metric:** with only ~5 % defects, accuracy and ROC-AUC can look fine for
-a useless model. PR-AUC compared with the prevalence shows whether alarms carry real information.
+**Classification report** (test window, frozen threshold, printed in notebook Section 8):
 
-### Is F1 0.233 correct? (notebook §9)
+```text
+              precision    recall  f1-score   support
+
+    pass (0)      0.958     0.929     0.943       296
+  defect (1)      0.192     0.294     0.233        17
+
+    accuracy                          0.895       313
+   macro avg      0.575     0.612     0.588       313
+weighted avg      0.917     0.895     0.905       313
+```
+
+**Why PR-AUC is the main metric:** with only ~5 % defects, accuracy and ROC-AUC can look fine for
+a useless model. The report above shows this: accuracy is 0.895, yet a model that flagged nothing
+at all would score 0.946. PR-AUC compared with the prevalence shows whether alarms carry real
+information.
+
+### Is F1 0.233 correct? (notebook Section 9)
 
 | Check | Result |
 |---|---|
